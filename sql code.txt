@@ -1,0 +1,124 @@
+DROP TABLE IF EXISTS Detailed_Table;
+CREATE TABLE Detailed_Table (
+    payment_id INT,
+    amount NUMERIC (5,2),
+    payment_date TIMESTAMP,
+    film_id SMALLINT,
+    inventory_id INT,
+    rental_id INT,
+    category_id SMALLINT,
+    category_name VARCHAR (25),
+    payment_timezone TIMESTAMP WITH TIME ZONE
+);
+
+DROP TABLE IF EXISTS Summary_Report;
+CREATE TABLE Summary_Report (
+    category_name VARCHAR (25),
+    total_amount NUMERIC (8,2)
+);
+
+--Create new field to transform payment_data data type to WITH TIMEZONE.
+CREATE OR REPLACE FUNCTION convert_to_payment_timezone(input_timestamp TIMESTAMP)
+RETURNS TIMESTAMP WITH TIME ZONE
+AS $$
+BEGIN
+    RETURN input_timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'America/Chicago';
+END;
+$$ LANGUAGE plpgsql;
+
+--Create the function for raw data extraction. Transform payment_date data type.
+CREATE OR REPLACE FUNCTION extract_raw_data()
+RETURNS TABLE (
+    payment_id INT,
+    amount NUMERIC (5,2),
+    payment_date TIMESTAMP,
+    film_id SMALLINT,
+    inventory_id INT,
+    rental_id INT,
+    category_id SMALLINT,
+    category_name VARCHAR (25),
+    payment_timezone TIMESTAMP WITH TIME ZONE
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        p.payment_id,
+        p.amount,
+        p.payment_date,
+        fc.film_id,
+        r.inventory_id,
+        p.rental_id,
+        fc.category_id,
+        c.name AS category_name,
+        convert_to_payment_timezone(p.payment_date) AS payment_timezone
+    FROM
+        payment p
+    INNER JOIN rental r ON p.rental_id = r.rental_id
+    INNER JOIN inventory i ON r.inventory_id = i.inventory_id
+    INNER JOIN film_category fc ON i.film_id = fc.film_id
+    INNER JOIN category c ON fc.category_id = c.category_id;
+END;
+$$ LANGUAGE plpgsql;
+
+--Extract data into detailed table.
+INSERT INTO Detailed_Table (payment_id, amount, payment_date, film_id, inventory_id, rental_id, category_id, category_name, payment_timezone)
+SELECT * FROM extract_raw_data();
+
+
+-- Create the trigger function
+CREATE OR REPLACE FUNCTION update_summary_report()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Check if the current operation is an INSERT
+    IF TG_OP = 'INSERT' THEN
+        -- Calculate the total amount for each category and update the Summary_Report table
+        INSERT INTO Summary_Report (category_name, total_amount)
+        SELECT
+            NEW.category_name,
+            SUM(amount) AS total_amount
+        FROM
+            Detailed_Table
+        WHERE
+            category_name = NEW.category_name
+        GROUP BY
+            NEW.category_name;
+	END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create the INSERT trigger on the Detailed_Table
+CREATE TRIGGER update_summary_trigger
+AFTER INSERT ON Detailed_Table
+FOR EACH ROW
+EXECUTE FUNCTION update_summary_report();
+
+--Create the stored procedure to refresh data.
+CREATE OR REPLACE PROCEDURE refresh_data()
+AS $$
+BEGIN
+    -- Clear the contents of the Summary_Report table
+    DELETE FROM Summary_Report;
+
+    -- Clear the contents of the Detailed_Table
+    DELETE FROM Detailed_Table;
+
+    -- Perform the raw data extraction using the function and populate Detailed_Table
+    INSERT INTO Detailed_Table (payment_id, amount, payment_date, film_id, inventory_id, rental_id, category_id, category_name, payment_timezone)
+    SELECT * FROM extract_raw_data();
+
+    -- Recalculate the data and populate the Summary_Report table
+    INSERT INTO Summary_Report (category_name, total_amount)
+    SELECT
+        category_name,
+        SUM(amount) AS total_amount
+    FROM
+        Detailed_Table
+    GROUP BY
+        category_name;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Call the stored procedure to refresh data.
+CALL refresh_data();
+
